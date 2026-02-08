@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 load_dotenv()
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.getenv("API_KEY")
+PORT = os.getenv("PORT", "7860")
 
 # -----------------------
 # API helpers
@@ -144,6 +145,8 @@ def save_annotations(
     year: int,
     language: str,
     source_ref: str,
+    is_humatheque: bool,
+    collection_code: str,
     annotator: str,
     notes: str,
 ):
@@ -166,10 +169,17 @@ def save_annotations(
     case_name = build_case_name(doc_id, page_no)
 
     # Upsert case
+    orig_w, orig_h = image_with_boxes.size
+
+    # Upsert case
     case_payload = {
         "case_name": case_name, "doc_type": doc_type, "doc_id": doc_id or None,
         "page_no": int(page_no), "year": int(year) if year else None, "language": language or None,
         "source_ref": source_ref or None, "image_uri": image_url, "image_sha256": None, "notes": notes or None,
+        "is_humatheque": bool(is_humatheque) if is_humatheque is not None else None,
+        "collection_code": (collection_code or None),
+        "image_width": int(orig_w),
+        "image_height": int(orig_h),
     }
     try:
         case_id = api_post("/cases/upsert", case_payload)
@@ -179,9 +189,7 @@ def save_annotations(
     rects = annotations if isinstance(annotations, list) else []
     if not rects:
         return "No rectangles found. Draw at least one bbox.", case_id
-
-    orig_w, orig_h = image_with_boxes.size
-    sx, sy = 1.0, 1.0 # Assume no scaling for now
+    sx, sy = 1.0, 1.0  # Assume no scaling for now
 
     saved, errors = 0, 0
     # Iterate through each annotation, which now includes its block_code
@@ -216,7 +224,7 @@ def save_annotations(
     except Exception as e:
         return f"Saved {saved} rect(s), but failed to fetch annotations: {e}", case_id
 
-    msg = f"✅ Saved {saved} rectangle(s) for case '{case_name}'. ({errors} error(s) occurred)"
+    msg = f"âœ… Saved {saved} rectangle(s) for case '{case_name}'. ({errors} error(s) occurred)"
     if errors:
         msg += f" (Some errors occurred)"
 
@@ -304,71 +312,147 @@ def update_row_label_and_redraw(row_index, block_choice, boxes, clean_img):
 def make_app():
     camp_choices, block_choices, _, _ = refresh_reference_data()
 
-    with gr.Blocks(title="WP1 Layout — bbox annotation", theme=gr.themes.Default(primary_hue="blue", secondary_hue="neutral")) as demo:
-        gr.Markdown("# WP1 Layout — Annotation de blocs (bboxes)")
-        gr.Markdown("Load an image by url, draw boxes, select a label, then save in Postgres Database by API middleware.")
+    custom_css = """
+    .app-shell {max-width: 1320px; margin: 0 auto; padding: 10px 6px 18px;}
+    .hero {
+      border: 1px solid #d9e2ef;
+      border-radius: 14px;
+      padding: 14px 16px;
+      background: linear-gradient(120deg, #f8fbff 0%, #f4f7ff 40%, #f8fbff 100%);
+      margin-bottom: 10px;
+    }
+    .panel {
+      border: 1px solid #dfe7f5;
+      border-radius: 12px;
+      background: #fbfdff;
+      padding: 10px;
+    }
+    """
 
-        # States
-        clean_img_state = gr.State()
-        pending_point_state = gr.State()
-        annotations_state = gr.State([])
+    with gr.Blocks(
+        title="WP1 Layout - bbox annotation",
+        theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"),
+        css=custom_css,
+    ) as demo:
+        with gr.Column(elem_classes=["app-shell"]):
+            gr.Markdown(
+                """
+                <div class="hero">
+                  <h2 style="margin:0;">WP1 Layout Annotation</h2>
+                  <p style="margin:6px 0 0 0;">
+                    Load an image URL, draw bounding boxes with two clicks, assign block labels,
+                    and save annotations through the API.
+                  </p>
+                </div>
+                """
+            )
 
-        with gr.Row():
-            image_url = gr.Textbox(label="Image URL", placeholder="https://raw.githubusercontent.com/.../123456789/p0001.png", scale=4)
-            load_btn = gr.Button("Load", scale=1)
-
-        status = gr.Markdown("")
-        
-        img = gr.Image(label="Image (click twice to draw a rectangle)", type="pil", interactive=True)
-
-        with gr.Row():
-            undo_btn = gr.Button("Undo last point/box")
-            clear_btn = gr.Button("Clear all boxes")
-        
-        box_display = gr.Dataframe(
-            headers=["x1", "y1", "x2", "y2", "Block Label"],
-            label="Drawn Boxes Coordinates",
-            interactive=False,
-        )
-
-        gr.Markdown(
-            "### How to Annotate\n" 
-            "- **Workflow**: Choose a **label** from the dropdown below, click **twice** on the image to draw a bounding box, repeat to add more boxes.\n" 
-            "- **Undo** removes the last point or the last completed box. **Clear** erases all boxes on the image.\n" 
-            "- The coordinates of the drawn boxes, along with their associated block label, appear in the table above.\n" 
-            "- After saving, you can clear the boxes with **Clear** to start a new batch with a different label."
-        )
-
-        with gr.Accordion("Metadata (Annotation Details)", open=True):
-            with gr.Row():
-                with gr.Column(scale=2): # Campaign and Block are main classification, give them more space
-                    campaign = gr.Dropdown(label="Campaign", choices=camp_choices, value=camp_choices[0])
-                with gr.Column(scale=1):
-                    block = gr.Dropdown(label="Block label", choices=block_choices, value=block_choices[0])
+            # States
+            clean_img_state = gr.State()
+            pending_point_state = gr.State()
+            annotations_state = gr.State([])
 
             with gr.Row():
-                selected_row = gr.Number(label="Selected row index", value=0, precision=0)
-            
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("#### Document Information")
-                    doc_type = gr.Dropdown(label="doc_type", choices=["these", "memoire", "other"], value="these")
-                    doc_id = gr.Textbox(label="doc_id (PPN recommended)", placeholder="123456789")
-                    page_no = gr.Number(label="page_no", value=1, precision=0)
-                    year = gr.Number(label="year", value=2000, precision=0)
-                    language = gr.Textbox(label="language", value="fr")
-                    source_ref = gr.Textbox(label="source_ref (optional)", placeholder="thesis/123456789/p0001.png")
+                image_url = gr.Textbox(
+                    label="Image URL",
+                    placeholder="https://raw.githubusercontent.com/.../123456789/p0001.png",
+                    scale=5,
+                )
+                load_btn = gr.Button("Load image", scale=1, variant="primary")
 
-                with gr.Column():
-                    gr.Markdown("#### Annotation Details")
-                    annotator = gr.Textbox(label="annotator", value=os.getenv("USER", "ggeoffroy"))
-                    notes = gr.Textbox(label="notes", lines=4, placeholder="Any notes about this annotation...")
+            status = gr.Markdown("")
 
-        save_btn = gr.Button("✅ Save all drawn rectangles", variant="primary")
-        
-        with gr.Accordion("API Response", open=False):
-            out_msg = gr.Textbox(label="Status", lines=2, interactive=False)
-            out_json = gr.Code(label="Stored annotations (JSON)", language="json")
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=6, elem_classes=["panel"]):
+                    img = gr.Image(
+                        label="Canvas (click twice to draw a rectangle)",
+                        type="pil",
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        undo_btn = gr.Button("Undo last point/box")
+                        clear_btn = gr.Button("Clear all boxes")
+
+                with gr.Column(scale=6, elem_classes=["panel"]):
+                    gr.Markdown("### Box annotation manager")
+                    with gr.Row():
+                        with gr.Column(scale=5, min_width=520):
+                            box_display = gr.Dataframe(
+                                headers=["x1", "y1", "x2", "y2", "Block Label"],
+                                label="Box coordinates",
+                                interactive=False,
+                                column_widths=[72, 72, 72, 72, 160],
+                            )
+                        with gr.Column(scale=2, min_width=220):
+                            block = gr.Dropdown(
+                                label="Label for selected box",
+                                choices=block_choices,
+                                value=block_choices[0],
+                            )
+                            selected_row = gr.Number(
+                                label="Selected row",
+                                value=0,
+                                precision=0,
+                            )
+                            gr.Markdown(
+                                "- Select a row in the table.\n"
+                                "- Change its label with the dropdown.\n"
+                                "- New boxes use the current dropdown label."
+                            )
+
+            with gr.Accordion("Metadata and save options", open=True):
+                with gr.Row():
+                    campaign = gr.Dropdown(
+                        label="Campaign",
+                        choices=camp_choices,
+                        value=camp_choices[0],
+                    )
+                    annotator = gr.Textbox(
+                        label="Annotator",
+                        value=os.getenv("USER", "ggeoffroy"),
+                    )
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### Document source/1")
+                        with gr.Row():
+                            doc_type = gr.Dropdown(
+                                label="Document type",
+                                choices=["these", "memoire", "other"],
+                                value="these",
+                            )
+                            doc_id = gr.Textbox(
+                                label="Document ID (PPN recommended)",
+                                placeholder="123456789",
+                            )
+                        page_no = gr.Number(label="Page number", value=1, precision=0)
+                        with gr.Row():
+                            year = gr.Number(label="Year", value=2000, precision=0)
+                            language = gr.Textbox(label="Language", value="fr")
+                        source_ref = gr.Textbox(
+                            label="Source ref (optional)",
+                            placeholder="thesis/123456789/p0001.png",
+                        )                        
+
+                    with gr.Column():
+                        gr.Markdown("#### Document source/2")
+                        is_humatheque = gr.Checkbox(label="Humathèque ?", value=False)
+                        collection_code = gr.Textbox(
+                            label="Collection code (optional)",
+                            placeholder="Ex: HUM-ARCH / HUM-THESES ...",
+                        )
+                        gr.Markdown("#### Annotation notes")
+                        notes = gr.Textbox(
+                            label="Notes",
+                            lines=8,
+                            placeholder="Any notes about this annotation...",
+                        )
+
+            save_btn = gr.Button("Save all drawn rectangles", variant="primary")
+
+            with gr.Accordion("API response", open=False):
+                out_msg = gr.Textbox(label="Status", lines=2, interactive=False)
+                out_json = gr.Code(label="Stored annotations (JSON)", language="json")
 
         # Actions
         load_btn.click(
@@ -388,7 +472,7 @@ def make_app():
             inputs=[pending_point_state, annotations_state, clean_img_state],
             outputs=[img, pending_point_state, annotations_state, box_display]
         )
-        
+
         clear_btn.click(
             fn=clear_all_boxes,
             inputs=[clean_img_state],
@@ -407,12 +491,12 @@ def make_app():
             outputs=[annotations_state, box_display, img]
         )
 
-        
+
         save_btn.click(
             fn=save_annotations,
             inputs=[
                 image_url, img, annotations_state, campaign, # block is now in annotations_state
-                doc_type, doc_id, page_no, year, language, source_ref, annotator, notes
+                doc_type, doc_id, page_no, year, language, source_ref, is_humatheque, collection_code, annotator, notes
             ],
             outputs=[out_msg, out_json],
         )
@@ -421,4 +505,5 @@ def make_app():
 
 if __name__ == "__main__":
     demo = make_app()
-    demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))
+    demo.launch(server_name="0.0.0.0", server_port=int(PORT))
+
