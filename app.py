@@ -45,7 +45,6 @@ from minio import Minio
 load_dotenv()
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.getenv("API_KEY")
-PORT = os.getenv("GRADIO_PORT", "7860")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT_URL")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
@@ -703,5 +702,5 @@ def make_app():
 
 if __name__ == "__main__":
     demo = make_app()
-    demo.launch(server_name="0.0.0.0", server_port=int(PORT))
+    demo.launch(server_name="0.0.0.0", server_port=7860)
 
