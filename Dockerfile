@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Code
 COPY . /app
+RUN chown -R appuser:appuser /app
 
 # Port (informative)
 EXPOSE 7860
