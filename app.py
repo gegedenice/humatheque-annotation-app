@@ -29,16 +29,46 @@ Env (local) :
 import os
 import io
 import json
+import shutil
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
+
 import requests
 import numpy as np
 import gradio as gr
 from PIL import Image, ImageDraw
 from dotenv import load_dotenv
+from minio import Minio
 
 load_dotenv()
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.getenv("API_KEY")
-PORT = os.getenv("PORT", "7860")
+PORT = os.getenv("GRADIO_PORT", "7860")
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT_URL")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
+BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "images")
+
+MINIO_ENABLED = bool(MINIO_ENDPOINT and MINIO_ACCESS_KEY and MINIO_SECRET_KEY)
+minio_client = None
+if MINIO_ENABLED:
+    secure = not (
+        MINIO_ENDPOINT.startswith("http://")
+        or "localhost" in MINIO_ENDPOINT
+        or "127.0.0.1" in MINIO_ENDPOINT
+    )
+    clean_endpoint = MINIO_ENDPOINT.replace("http://", "").replace("https://", "")
+    minio_client = Minio(
+        clean_endpoint,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=secure,
+    )
+
+BUCKET = "images"
+LOCAL_ROOT = Path("./.bucket_cache") / BUCKET 
 
 # -----------------------
 # API helpers
@@ -68,9 +98,103 @@ def fetch_image(url: str) -> Image.Image:
     r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
+def sync_bucket(bucket: str, local_root: Path):                                                                                                                                                             
+    local_root.mkdir(parents=True, exist_ok=True)                                                                                                                                                           
+    for obj in minio_client.list_objects(bucket, recursive=True):                                                                                                                                           
+        dst = local_root / obj.object_name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        minio_client.fget_object(bucket, obj.object_name, str(dst))
+
+def fetch_minio_image(object_name: str) -> Image.Image:
+    response = minio_client.get_object(BUCKET_NAME, object_name)
+    try:
+        image_bytes = response.read()
+    finally:
+        response.close()
+        response.release_conn()
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+def refresh_tree():
+    if not MINIO_ENABLED or minio_client is None:
+        return gr.update(value=[]), "MinIO is not configured in .env."
+    try:
+        sync_bucket(BUCKET, LOCAL_ROOT)
+        refreshed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return gr.update(value=[]), f"Last refresh: {refreshed_at}"
+    except Exception as e:
+        return gr.update(value=[]), f"Refresh error: {e}"
+
+def load_image_from_tree(selected_path):
+    if not selected_path:
+        return [gr.skip()] * 7
+    if isinstance(selected_path, list):
+        if not selected_path:
+            return [gr.skip()] * 7
+        selected_path = selected_path[0]
+
+    selected_str = str(selected_path).strip()
+    if not selected_str:
+        return [gr.skip()] * 7
+
+    local_path = Path(selected_str)
+    if not local_path.is_absolute():
+        local_path = (Path.cwd() / local_path).resolve()
+
+    if local_path.is_dir():
+        return [gr.skip()] * 7
+
+    if local_path.exists():
+        try:
+            loaded_img = Image.open(local_path).convert("RGB")
+            w, h = loaded_img.size
+            object_name = local_path.name
+            try:
+                object_name = local_path.relative_to(LOCAL_ROOT.resolve()).as_posix()
+            except Exception:
+                posix_path = local_path.as_posix()
+                marker = f"/{BUCKET}/"
+                if marker in posix_path:
+                    object_name = posix_path.split(marker, 1)[1]
+            status = f"Loaded local image {w}x{h}: {local_path}"
+            image_uri = f"minio://{BUCKET_NAME}/{object_name}"
+            # Return numpy array for display, PIL for state
+            img_array = np.array(loaded_img)
+            return img_array, status, loaded_img, [], [], None, image_uri
+        except Exception as e:
+            return gr.skip(), f"Error loading local image: {e}", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+
+    normalized = selected_str.replace("\\", "/")
+    marker = f"/{BUCKET}/"
+    if marker in normalized:
+        object_name = normalized.split(marker, 1)[1]
+    else:
+        object_name = normalized.lstrip("./")
+        local_root_norm = str(LOCAL_ROOT).replace("\\", "/").lstrip("./")
+        if object_name.startswith(local_root_norm + "/"):
+            object_name = object_name[len(local_root_norm) + 1 :]
+
+    if object_name.startswith(f"{BUCKET_NAME}/"):
+        object_name = object_name[len(BUCKET_NAME) + 1 :]
+
+    if not object_name or not MINIO_ENABLED or minio_client is None:
+        return [gr.skip()] * 7
+
+    try:
+        loaded_img = fetch_minio_image(object_name)
+        w, h = loaded_img.size
+        status = f"Loaded MinIO image {w}x{h}: {object_name}"
+        image_uri = f"minio://{BUCKET_NAME}/{object_name}"
+        # Return numpy array for display, PIL for state
+        img_array = np.array(loaded_img)
+        return img_array, status, loaded_img, [], [], None, image_uri
+    except Exception as e:
+        return gr.skip(), f"Error loading MinIO image: {e}", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+
 def draw_boxes_on_image(image: Image.Image, boxes, pending_point=None, selected_index=None):
-    """Helper to draw boxes and pending point on image."""
+    """Helper to draw boxes and pending point on image. Returns numpy array for efficiency."""
     if image is None: return None
+    
+    # Create a new image for drawing
     out_img = image.copy()
     draw = ImageDraw.Draw(out_img)
     w, h = image.size
@@ -94,7 +218,8 @@ def draw_boxes_on_image(image: Image.Image, boxes, pending_point=None, selected_
         draw.line([(0, y), (w, y)], fill="cyan", width=1)
         draw.line([(x, 0), (x, h)], fill="cyan", width=1)
 
-    return out_img
+    # Convert to numpy array for more efficient Gradio updates
+    return np.array(out_img)
 
 
 # -----------------------
@@ -115,14 +240,15 @@ def refresh_reference_data():
 
 
 def load_image_and_prepare(url: str):
-    """Loads image and returns (pil_image, width, height)."""
+    """Loads image and returns (numpy_array, status_msg, pil_image_for_state, [], [])."""
     if not url or not url.strip():
         return None, "Please paste an image URL.", None, [], []
     try:
         img = fetch_image(url.strip())
         w, h = img.size
-        # Return the clean image for display, and also store it in a state for redrawing
-        return img, f"Loaded image {w}×{h}", img, [], []
+        # Return numpy array for display, PIL image for state
+        img_array = np.array(img)
+        return img_array, f"Loaded image {w}×{h}", img, [], []
     except Exception as e:
         return None, f"Error loading image: {e}", None, [], []
 
@@ -233,14 +359,16 @@ def save_annotations(
 
 def on_image_select(evt: gr.SelectData, pending_pt, boxes, clean_img, block_choice):
     """Handle click on input image to define boxes."""
-    if clean_img is None: return gr.update(), pending_pt, boxes, gr.update()
+    if clean_img is None: return gr.skip(), pending_pt, boxes, boxes
 
     x, y = evt.index
     if pending_pt is None:
+        # First click: store pending point and redraw
         new_pending = (x, y)
         vis_img = draw_boxes_on_image(clean_img, boxes, new_pending)
         return vis_img, new_pending, boxes, boxes
     else:
+        # Second click: complete the box
         x1, y1 = pending_pt
         x2, y2 = x, y
         bbox = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
@@ -269,15 +397,26 @@ def undo_last_box(pending_pt, boxes, clean_img):
 
 def clear_all_boxes(clean_img):
     if clean_img is None: return gr.update(), [], []
-    return clean_img, [], []
+    # Convert PIL to numpy for display
+    return np.array(clean_img), [], []
 
 def select_box_row(evt: gr.SelectData, block_choice, boxes, clean_img):
+    """Select a row in the dataframe and highlight the corresponding box in red.
+    
+    Note: This requires an image redraw to show the red highlight, which is a 
+    necessary tradeoff for the important visual feedback of which box is selected.
+    """
     if evt is None or evt.index is None:
-        return gr.update(), boxes, boxes, gr.update()
+        return gr.update(), boxes, boxes, gr.skip()
     row = int(evt.index[0])
-    updated_boxes, _ = update_row_label(row, block_choice, boxes)
-    vis_img = draw_boxes_on_image(clean_img, updated_boxes, None, row)
-    return row, updated_boxes, updated_boxes, vis_img
+    
+    # We need to redraw to show the red highlight (visual feedback is worth it)
+    if clean_img is None:
+        return row, boxes, boxes, gr.skip()
+    
+    # Redraw image with the selected box highlighted in red
+    vis_img = draw_boxes_on_image(clean_img, boxes, None, row)
+    return row, boxes, boxes, vis_img
 
 def update_row_label(row_index, block_choice, boxes):
     """Updates the block label for a single row in the dataframe."""
@@ -299,10 +438,34 @@ def update_row_label(row_index, block_choice, boxes):
     return updated_boxes, updated_boxes
 
 def update_row_label_and_redraw(row_index, block_choice, boxes, clean_img):
+    """Update label and redraw only if there's an actual change."""
+    if row_index is None or not boxes:
+        return boxes, boxes, gr.skip()
+    
+    try:
+        row_idx = int(row_index)
+    except Exception:
+        return boxes, boxes, gr.skip()
+    
+    if row_idx < 0 or row_idx >= len(boxes):
+        return boxes, boxes, gr.skip()
+    
+    # Check if the label is actually changing
+    new_block_code = block_choice.split(" | ")[0].strip()
+    current_block_code = boxes[row_idx][4] if len(boxes[row_idx]) > 4 else None
+    
+    if current_block_code == new_block_code:
+        # No change needed
+        return boxes, boxes, gr.skip()
+    
+    # Actually update the label
     updated_boxes, _ = update_row_label(row_index, block_choice, boxes)
+    
     if clean_img is None:
-        return updated_boxes, updated_boxes, gr.update()
-    selected_idx = int(row_index) if row_index is not None else None
+        return updated_boxes, updated_boxes, gr.skip()
+    
+    # Redraw with selection highlight
+    selected_idx = int(row_index)
     vis_img = draw_boxes_on_image(clean_img, updated_boxes, None, selected_idx)
     return updated_boxes, updated_boxes, vis_img
 
@@ -328,7 +491,8 @@ def make_app():
       padding: 10px;
     }
     """
-
+    sync_bucket(BUCKET, LOCAL_ROOT)
+    
     with gr.Blocks(
         title="WP1 Layout - bbox annotation",
         theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"),
@@ -363,17 +527,29 @@ def make_app():
             status = gr.Markdown("")
 
             with gr.Row(equal_height=True):
-                with gr.Column(scale=6, elem_classes=["panel"]):
+                with gr.Column(scale=3, elem_classes=["panel"]):
+                    gr.Markdown("### MinIO Bucket Files")
+                    refresh_tree_btn = gr.Button("Refresh tree")
+                    tree_status = gr.Markdown("")
+                    file_explorer = gr.FileExplorer(
+                        root_dir=str(LOCAL_ROOT),
+                        glob="**/*",
+                        file_count="single",
+                        interactive=True,
+                        label="Bucket Files (tree view)",
+                    )
+
+                with gr.Column(scale=5, elem_classes=["panel"]):
                     img = gr.Image(
                         label="Canvas (click twice to draw a rectangle)",
-                        type="pil",
+                        type="numpy",
                         interactive=True,
                     )
                     with gr.Row():
                         undo_btn = gr.Button("Undo last point/box")
                         clear_btn = gr.Button("Clear all boxes")
 
-                with gr.Column(scale=6, elem_classes=["panel"]):
+                with gr.Column(scale=4, elem_classes=["panel"]):
                     gr.Markdown("### Box annotation manager")
                     with gr.Row():
                         with gr.Column(scale=5, min_width=520):
@@ -455,6 +631,28 @@ def make_app():
                 out_json = gr.Code(label="Stored annotations (JSON)", language="json")
 
         # Actions
+        demo.load(
+            fn=refresh_tree,
+            outputs=[file_explorer, tree_status],
+        )
+
+        refresh_tree_btn.click(
+            fn=refresh_tree,
+            outputs=[file_explorer, tree_status],
+        )
+
+        file_explorer.change(
+            fn=load_image_from_tree,
+            inputs=[file_explorer],
+            outputs=[img, status, clean_img_state, annotations_state, box_display, pending_point_state, image_url],
+        )
+        
+        file_explorer.select(
+            fn=load_image_from_tree,
+            inputs=[file_explorer],
+            outputs=[img, status, clean_img_state, annotations_state, box_display, pending_point_state, image_url],
+        )
+
         load_btn.click(
             fn=load_image_and_prepare,
             inputs=[image_url],
@@ -495,7 +693,7 @@ def make_app():
         save_btn.click(
             fn=save_annotations,
             inputs=[
-                image_url, img, annotations_state, campaign, # block is now in annotations_state
+                image_url, clean_img_state, annotations_state, campaign, # Use clean_img_state instead of img
                 doc_type, doc_id, page_no, year, language, source_ref, is_humatheque, collection_code, annotator, notes
             ],
             outputs=[out_msg, out_json],
