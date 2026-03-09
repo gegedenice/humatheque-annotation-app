@@ -978,7 +978,7 @@ def make_app():
     
     with gr.Blocks(
         title="Annotation app",
-        theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"),
+        theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate", neutral_hue="stone"),
         css=custom_css,
     ) as demo:
         with gr.Column(elem_classes=["app-shell"]):
@@ -1017,8 +1017,8 @@ def make_app():
                         value=None,
                         scale=6,
                     )
-                    refresh_cases_btn = gr.Button("Rafraichir les cas", scale=1)
-                    load_case_btn = gr.Button("Charger le cas", scale=1, variant="secondary")
+                    load_case_btn = gr.Button("Charger le cas", scale=1, variant="primary")
+                    refresh_cases_btn = gr.Button("Rafraichir les cas", scale=1, variant="neutral")                    
                 existing_cases_status = gr.Markdown("")
             with gr.Accordion("Annotations existantes - Mémoires sans type", open=False, elem_classes=["highlight-accordion"]):
                 with gr.Row():
@@ -1028,8 +1028,8 @@ def make_app():
                         value=None,
                         scale=6,
                     )
-                    refresh_memoire_cases_btn = gr.Button("Rafraichir les cas", scale=1)
-                    load_memoire_case_btn = gr.Button("Charger le cas", scale=1, variant="secondary")
+                    load_memoire_case_btn = gr.Button("Charger le cas", scale=1, variant="primary")
+                    refresh_memoire_cases_btn = gr.Button("Rafraichir les cas", scale=1, variant="neutral")                   
                 memoire_cases_status = gr.Markdown("")
 
             with gr.Row():
@@ -1150,7 +1150,7 @@ def make_app():
 
             with gr.Row():
                 save_btn = gr.Button("Enregistrer une nouvelle annotation", variant="primary", visible=True)
-                save_meta_btn = gr.Button("Mettre a jour cette annotation existante", variant="secondary", visible=False)
+                save_meta_btn = gr.Button("Mettre à jour cette annotation existante", variant="primary", visible=False)
 
             with gr.Accordion("Reponse API", open=False, elem_classes=["highlight-accordion"]):
                 out_msg = gr.Textbox(label="Statut", lines=2, interactive=False)
